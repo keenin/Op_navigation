@@ -77,7 +77,7 @@ A device that is not connected comes back as an offline error (the Athena docs a
 
 ## Release
 
-Pushing a tag named `v*` (for example `v1.0.0`) builds the same debug APK and attaches it to a GitHub Release. Day-to-day builds upload the APK as the `op-navigation-debug` workflow artifact.
+Pushing a tag named `v*` (for example `v1.0.0`) builds the same debug APK and attaches it to a GitHub Release. A tag with a hyphen, such as `v1.0.1-test`, is published as a prerelease. Pushes to `main` and `cursor/**`, pull request updates, and manual `workflow_dispatch` runs upload the APK as the `op-navigation-debug` workflow artifact.
 
 ## Debug keystore
 
