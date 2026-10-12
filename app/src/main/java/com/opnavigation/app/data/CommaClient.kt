@@ -2,11 +2,9 @@ package com.opnavigation.app.data
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.ConnectException
 import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URL
-import java.net.UnknownHostException
 
 data class CommaDevice(
     val dongleId: String,
@@ -30,19 +28,24 @@ object CommaClient {
 
     fun normalizeToken(raw: String): String {
         var token = raw.trim()
-        if (token.startsWith("JWT ", ignoreCase = true)) {
-            token = token.substring(4).trim()
-        }
         if (token.length >= 2 &&
             ((token.startsWith("\"") && token.endsWith("\"")) ||
                 (token.startsWith("'") && token.endsWith("'")))
         ) {
             token = token.substring(1, token.length - 1).trim()
         }
-        return token
+        val bearer = token.length > 3 &&
+            token.regionMatches(0, "JWT", 0, 3, ignoreCase = true) &&
+            token[3].isWhitespace()
+        if (bearer) {
+            token = token.substring(3).trim()
+        }
+        return token.replace(Regex("\\s+"), "")
     }
 
-    fun normalizeDongle(raw: String): String = raw.trim().lowercase()
+    fun normalizeDongle(raw: String): String = raw.trim().trim('/').lowercase()
+
+    fun athenaUrl(dongleId: String): String = "$ATHENA_HOST/${normalizeDongle(dongleId)}"
 
     fun setDestination(token: String, dongleId: String, latitude: Double, longitude: Double): AthenaResult {
         if (latitude !in -90.0..90.0 || longitude !in -180.0..180.0) {
@@ -71,18 +74,26 @@ object CommaClient {
 
     fun listDevices(token: String): List<CommaDevice> {
         val (status, text) = try {
-            request("GET", "$API_HOST/v1/me/devices/", token, null)
+            request(
+                method = "GET",
+                url = "$API_HOST/v1/me/devices/",
+                token = token,
+                body = null,
+                connectTimeoutMs = 15_000,
+                readTimeoutMs = 20_000,
+            )
         } catch (e: Exception) {
-            throw IllegalStateException(networkMessage(e), e)
+            throw IllegalStateException("Device list failed: ${describeFailure(e)}", e)
         }
         if (status == 401 || status == 403) {
-            throw IllegalStateException(jwtRejected())
+            throw IllegalStateException(httpFailure(jwtRejected(), status, text))
         }
         val array = try {
             JSONArray(text)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             val message = jsonErrorMessage(text.toJsonObjectOrNull())
-            throw IllegalStateException(message ?: "Couldn't list devices (HTTP $status).")
+            val summary = message ?: "Couldn't list devices (${describeFailure(e)})"
+            throw IllegalStateException(httpFailure(summary, status, text))
         }
         return buildList {
             for (i in 0 until array.length()) {
@@ -111,35 +122,61 @@ object CommaClient {
     }
 
     private fun call(token: String, dongleId: String, body: JSONObject, okMessage: String): AthenaResult {
+        val url = athenaUrl(dongleId)
         val (status, text) = try {
-            request("POST", "$ATHENA_HOST/$dongleId", token, body.toString())
+            request(
+                method = "POST",
+                url = url,
+                token = token,
+                body = body.toString(),
+                connectTimeoutMs = 20_000,
+                // Athena holds the HTTP call open while it waits for the device.
+                readTimeoutMs = 60_000,
+            )
         } catch (e: Exception) {
-            return AthenaResult(false, networkMessage(e))
+            val hint = if (e is SocketTimeoutException) {
+                "Timed out waiting for comma or the device. "
+            } else {
+                ""
+            }
+            return AthenaResult(false, "${hint}Athena $url failed: ${describeFailure(e)}")
         }
         return interpretAthena(status, text, okMessage)
     }
 
-    private fun request(method: String, url: String, token: String, body: String?): Pair<Int, String> {
-        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = method
-            connectTimeout = 15_000
-            readTimeout = 25_000
-            instanceFollowRedirects = true
-            setRequestProperty("Authorization", "JWT $token")
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("User-Agent", "OpenpilotTools")
-            if (body != null) {
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-            }
-        }
+    private fun request(
+        method: String,
+        url: String,
+        token: String,
+        body: String?,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
+    ): Pair<Int, String> {
+        val bytes = body?.toByteArray(Charsets.UTF_8)
+        val connection = (URL(url).openConnection() as HttpURLConnection)
         try {
-            if (body != null) {
-                connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            // A 301/302 would turn this POST into a GET and drop the body.
+            connection.instanceFollowRedirects = false
+            connection.connectTimeout = connectTimeoutMs
+            connection.readTimeout = readTimeoutMs
+            connection.requestMethod = method
+            connection.setRequestProperty("Authorization", "JWT $token")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("User-Agent", "OpenpilotTools")
+            if (bytes != null) {
+                connection.doOutput = true
+                connection.setRequestProperty("Content-Type", "application/json")
+                connection.setFixedLengthStreamingMode(bytes.size)
+                connection.outputStream.use { it.write(bytes) }
             }
             val status = connection.responseCode
+            val location = connection.getHeaderField("Location").orEmpty()
             val stream = if (status in 200..299) connection.inputStream else connection.errorStream
             val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            if (status in 300..399 && text.isBlank()) {
+                val where = location.ifBlank { "(no Location header)" }
+                return status to "redirect to $where"
+            }
             return status to text
         } finally {
             connection.disconnect()
@@ -154,11 +191,16 @@ internal fun interpretAthena(statusCode: Int, body: String, okMessage: String): 
     if (statusCode in 200..299 && result is JSONObject && isSuccessFlag(result.opt("success"))) {
         return AthenaResult(true, okMessage)
     }
+    fun fail(summary: String) = AthenaResult(false, httpFailure(summary, statusCode, text))
+
     if (statusCode == 401 || statusCode == 403) {
-        return AthenaResult(false, jwtRejected())
+        return fail(jwtRejected())
     }
     if (statusCode == 404) {
-        return AthenaResult(false, "comma doesn't recognize that dongle ID. Check it in Settings.")
+        return fail("comma doesn't recognize that dongle ID. Check it in Settings.")
+    }
+    if (statusCode in 300..399) {
+        return fail("Athena redirected this POST. The request URL should be https://athena.comma.ai/<dongle_id> with no trailing slash.")
     }
 
     val errorMessage = jsonErrorMessage(json)
@@ -175,29 +217,24 @@ internal fun interpretAthena(statusCode: Int, body: String, okMessage: String): 
         } else {
             "Device is offline. Turn the car on so openpilot is connected, then try again."
         }
-        return AthenaResult(false, message)
+        return fail(message)
     }
     if (errorMessage != null && errorMessage.contains("method not found", ignoreCase = true)) {
-        return AthenaResult(
-            false,
-            "This openpilot build has no nav alpha. Update the device to a build with setNavDestination.",
-        )
+        return fail("This openpilot build has no nav alpha. Update the device to a build with setNavDestination.")
     }
     if (result is JSONObject) {
         val err = result.optString("error").takeIf { it.isNotBlank() }
-        if (err != null) return AthenaResult(false, err)
+        if (err != null) return fail(err)
         if (!isSuccessFlag(result.opt("success"))) {
-            return AthenaResult(false, "The device rejected the request.")
+            return fail("The device rejected the request.")
         }
     }
-    if (!errorMessage.isNullOrBlank()) return AthenaResult(false, errorMessage)
-    if (result is String && result.isNotBlank()) return AthenaResult(false, result)
+    if (!errorMessage.isNullOrBlank()) return fail(errorMessage)
+    if (result is String && result.isNotBlank()) return fail(result)
     if (statusCode !in 200..299) {
-        val detail = text.take(140)
-        val suffix = if (detail.isBlank()) "" else ": $detail"
-        return AthenaResult(false, "comma returned HTTP $statusCode$suffix")
+        return fail("comma rejected the request")
     }
-    return AthenaResult(false, "Unexpected response from comma.")
+    return fail("Unexpected response from comma")
 }
 
 private fun isSuccessFlag(value: Any?): Boolean = when (value) {
@@ -232,14 +269,6 @@ private fun jsonErrorMessage(json: JSONObject?): String? {
 
 private fun jwtRejected(): String =
     "JWT was rejected. Open jwt.comma.ai, sign in with the account you use for Connect, and paste a new token."
-
-private fun networkMessage(error: Exception): String = when (error) {
-    is SocketTimeoutException ->
-        "The device didn't answer. It is probably offline — turn the car on so openpilot is connected, then try again."
-    is UnknownHostException, is ConnectException ->
-        "Couldn't reach comma. Check this phone's connection and try again."
-    else -> error.message?.takeIf { it.isNotBlank() } ?: "Network error."
-}
 
 private fun String.toJsonObjectOrNull(): JSONObject? =
     try {

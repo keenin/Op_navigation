@@ -13,6 +13,7 @@ import com.opnavigation.app.data.Favorite
 import com.opnavigation.app.data.PlaceException
 import com.opnavigation.app.data.Places
 import com.opnavigation.app.data.SecureStore
+import com.opnavigation.app.data.describeFailure
 import com.opnavigation.app.data.emptyFavorites
 import com.opnavigation.app.data.formatLatLon
 import kotlinx.coroutines.Dispatchers
@@ -91,13 +92,13 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         val (jwt, dongle) = credentials() ?: return
         launchRequest {
             val place = try {
-                withContext(Dispatchers.IO) { Places.resolve(getApplication(), trimmed) }
+                Places.resolve(getApplication(), trimmed)
             } catch (e: PlaceException) {
-                return@launchRequest e.message ?: "Couldn't resolve that place."
+                return@launchRequest e.message ?: describeFailure(e)
             }
             val result = CommaClient.setDestination(jwt, dongle, place.latitude, place.longitude)
             if (result.ok) {
-                onSuccess()
+                withContext(Dispatchers.Main) { onSuccess() }
                 "Sent ${place.label}"
             } else {
                 result.message
@@ -125,9 +126,9 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
             val place = try {
                 withContext(Dispatchers.IO) { Places.resolve(getApplication(), trimmedQuery) }
             } catch (e: PlaceException) {
-                return e.message
+                return e.message ?: describeFailure(e)
             } catch (e: Exception) {
-                return e.message ?: "Couldn't resolve that place."
+                return describeFailure(e)
             }
             Favorite(
                 name = trimmedName,
@@ -166,7 +167,7 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
                     devicesError = "No devices on this account."
                 }
             } catch (e: Exception) {
-                devicesError = e.message ?: "Couldn't list devices."
+                devicesError = e.message ?: describeFailure(e)
             } finally {
                 devicesLoading = false
             }
@@ -192,9 +193,11 @@ class NavViewModel(app: Application) : AndroidViewModel(app) {
         busy = true
         viewModelScope.launch {
             val message = try {
-                block()
+                // viewModelScope is the main thread. Athena and geocoding have to
+                // leave it, or Android throws NetworkOnMainThreadException.
+                withContext(Dispatchers.IO) { block() }
             } catch (e: Exception) {
-                e.message ?: "Something went wrong."
+                describeFailure(e)
             }
             busy = false
             toast(message)

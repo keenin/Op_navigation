@@ -50,7 +50,7 @@ Both values are saved as you type.
 The device must be awake and connected to comma. Nav alpha does not queue a destination for later; if the car is off, the app says the device is offline.
 
 1. Long-press a favorite. Enter a name and either an address or coordinates.
-   - Addresses are resolved with Android's Geocoder when you save, so the tap itself only sends coordinates.
+   - Addresses are resolved when you save, so the tap itself only sends coordinates. The phone's geocoder is tried first. If it fails (it often throws `IOException: network error` even when the phone is online), lookup continues with OpenStreetMap Nominatim.
    - Coordinates can be `32.87513, -117.20978`, `32.87513 -117.20978`, or a Google Maps link (`@lat,lon` or `q=lat,lon`).
 2. Tap the favorite. The app sends it immediately and shows a success or error toast.
 3. **Go** under **Address or lat, lon** sends a one-off destination the same way.
@@ -73,7 +73,7 @@ curl -X POST "https://athena.comma.ai/$DONGLE_ID" \
 
 The published OpenAPI schema types `setNavDestination` params as the older `NavigationDestination` object (`place_name`, `place_details`, latitude, longitude). The device method does not accept those extra fields, so this app sends only `latitude` and `longitude`.
 
-A device that is not connected comes back as an offline error (the Athena docs also use the phrase `Device offline, message queued` for methods that can wait). This app says so directly. A build without nav alpha comes back as method-not-found.
+A device that is not connected comes back as an offline error (the Athena docs also use the phrase `Device offline, message queued` for methods that can wait). The toast includes the HTTP status and response body, or the exception class and message, so a failure can be told apart from a geocoder problem. A build without nav alpha comes back as method-not-found.
 
 ## Release
 
